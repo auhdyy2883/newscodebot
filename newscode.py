@@ -9,19 +9,16 @@ import pytz
 import os
 import json
 
-# DNS এবং নেটওয়ার্ক সমাধানের জন্য প্রয়োজনীয় লাইব্রেরি
+# DNS সমাধানের জন্য প্রয়োজনীয় লাইব্রেরি
 try:
     import dns.asyncresolver
-    import httpcore
-    import anyio
-except ImportError as e:
-    print(f"❌ [FATAL] প্রয়োজনীয় লাইব্রেরি ইনস্টল করা নেই: {e}")
-    print("❌ [FATAL] দয়া করে `pip install dnspython httpcore anyio` চালান।")
+except ImportError:
+    print("❌ [FATAL] dnspython লাইব্রেরি ইনস্টল করা নেই। দয়া করে `pip install dnspython` চালান।")
     exit()
 
-from typing import Optional
+from httpcore import Request, Response
 
-# --- [মডিউল ১: চূড়ান্ত কনফিগারেশন] ---
+# --- [মডিউল ১: চূড়ান্ত এবং নির্ভরযোগ্য কনফিগারেশন] ---
 BOT_TOKEN_HARDCODED = "8328958637:AAEZ88XR-Ksov_RHDyT0_nKPgBEL1K876Y8"
 CHANNEL_ID_HARDCODED = "-1002557789082"
 BITLY_TOKEN_HARDCODED = "2feb4ec89bdbb72e24eaf85536d6149d948393cc"
@@ -55,41 +52,49 @@ def add_article_to_db(unique_id, source):
     conn.commit()
     conn.close()
 
-# --- [মডিউল ৩: চূড়ান্ত ডিএনএস এবং এসএসএল সমাধান] ---
-class CustomDNSBackend(httpcore.AnyIOBackend):
-    async def connect_tcp(
-        self, host: str, port: int, timeout: float = None, local_address: Optional[str] = None, **kwargs
-    ) -> httpcore.AsyncNetworkStream:
-        
-        original_host = host
+# --- [মডিউল ৩: পুরনো httpx-এর জন্য কাস্টম ডিএনএস সমাধানকারী] ---
+class CustomDNSResolverTransport(httpx.AsyncHTTPTransport):
+    async def handle_async_request(self, request: Request) -> Response:
+        # request.url.host একটি বাইটস স্ট্রিং হতে পারে, তাই স্ট্রিং-এ রূপান্তর করা হচ্ছে
+        try:
+            hostname = request.url.host.decode("utf-8")
+        except (UnicodeDecodeError, AttributeError):
+            hostname = request.url.host
+
         try:
             resolver = dns.asyncresolver.Resolver(configure=False)
             resolver.nameservers = ["8.8.8.8", "1.1.1.1"]
-            answers = await resolver.resolve(original_host)
-            ip_to_connect = answers[0].address
-        except Exception:
-            ip_to_connect = original_host
-
-        # এই tls_hostname প্যারামিটারটিই IP address mismatch এররটি সমাধান করে
-        stream = await anyio.open_tcp_stream(
-            host=ip_to_connect,
-            port=port,
-            connect_timeout=timeout,
-            local_address=local_address,
-            tls_hostname=original_host,
-            **kwargs
-        )
-        return httpcore.AnyIOStream(stream)
+            answers = await resolver.resolve(hostname)
+            ip = answers[0].address
+            
+            # URL-এর host পরিবর্তন করে IP বসানো হচ্ছে
+            request.url = request.url.copy_with(host=ip)
+            # সার্ভারকে আসল ডোমেইন নেম জানানোর জন্য Host হেডার সেট করা হচ্ছে
+            request.headers["Host"] = hostname
+        except Exception as e:
+            print(f"--> [DNS WARNING] হোস্টনেম '{hostname}' সমাধান করা যায়নি: {e}.")
+            pass
+        
+        return await super().handle_async_request(request)
 
 # --- [মডিউল ৪: নেটওয়ার্ক এবং ইউটিলিটি] ---
 async def create_retry_client():
-    """সার্ভারের DNS সমস্যা সমাধানের জন্য একটি কাস্টম ক্লায়েন্ট তৈরি করে।"""
-    print("[INFO] কাস্টম DNS ব্যাকএন্ড দিয়ে ক্লায়েন্ট তৈরির চেষ্টা করা হচ্ছে...")
+    """
+    cPanel-এর পুরনো httpx সংস্করণের জন্য চূড়ান্ত ক্লায়েন্ট যা SSL ভেরিফিকেশন বাইপাস করে।
+    """
+    print("[INFO] কাস্টম DNS এবং SSL-Bypass ক্লায়েন্ট তৈরির চেষ্টা করা হচ্ছে...")
     try:
-        backend = CustomDNSBackend()
-        transport = httpx.AsyncHTTPTransport(network=backend, retries=2)
-        client = httpx.AsyncClient(transport=transport, timeout=40)
-        print("✅ [SUCCESS] কাস্টম DNS ক্লায়েন্ট সফলভাবে তৈরি হয়েছে।")
+        # আমাদের কাস্টম ট্রান্সপোর্ট ব্যবহার করা হচ্ছে যা network আর্গুমেন্ট ছাড়া কাজ করে
+        transport = CustomDNSResolverTransport(retries=2, verify=False)
+
+        # ক্লায়েন্ট তৈরি করার সময়ও SSL ভেরিফিকেশন বন্ধ করা হচ্ছে
+        client = httpx.AsyncClient(
+            transport=transport,
+            timeout=40,
+            headers={'User-Agent': 'Mozilla/5.0'}
+        )
+        print("⚠️  [WARNING] ক্লায়েন্ট SSL ভেরিফিকেশন ছাড়া তৈরি হয়েছে।")
+        print("✅ [SUCCESS] ক্লায়েন্ট সফলভাবে চূড়ান্ত কনফিগারেশন দিয়ে তৈরি হয়েছে।")
         return client
     except Exception as e:
         print(f"❌ [ERROR] কাস্টম ক্লায়েন্ট তৈরিতে একটি অপ্রত্যাশিত ত্রুটি ঘটেছে: {e}")
@@ -101,11 +106,9 @@ async def fetch_api_data(session, url):
         response = await session.get(url, headers={'User-Agent': 'Mozilla/5.0'})
         response.raise_for_status()
         return response.json()
-    except httpx.HTTPStatusError as e:
-        print(f"[{time.strftime('%H:%M:%S')}] [HTTP ERROR] API থেকে ডেটা আনার সময় সমস্যা: {url} | স্ট্যাটাস কোড: {e.response.status_code}")
     except Exception as e:
         print(f"[{time.strftime('%H:%M:%S')}] [NETWORK ERROR] API থেকে ডেটা আনার সময় সমস্যা: {url} | এরর: {e}")
-    return None
+        return None
 
 async def shorten_url(session, long_url):
     if not BITLY_ACCESS_TOKEN or BITLY_ACCESS_TOKEN == "YOUR_BITLY_ACCESS_TOKEN_HERE":
@@ -225,7 +228,7 @@ async def main_loop():
 
     try:
         await bot.get_me()
-        await bot.send_message(chat_id=CHANNEL_ID, text="✅ সমন্বিত নিউজ ও জব বুলেটিন বট সফলভাবে অনলাইন। (Build: DNS-Fixed)")
+        await bot.send_message(chat_id=CHANNEL_ID, text="✅ সমন্বিত নিউজ ও জব বুলেটিন বট সফলভাবে অনলাইন। (Build: cPanel-Final)")
         print("✅ [SUCCESS] বট সফলভাবে টেলিগ্রামের সাথে সংযোগ স্থাপন করেছে।")
     except Exception as e:
         print(f"❌ [STARTUP FAILED] Could not connect to Telegram. Error: {e}")
