@@ -9,7 +9,19 @@ import pytz
 import os
 import json
 
-# --- [মডিউল ১: চূড়ান্ত এবং নির্ভরযোগ্য কনফিগারেশন] ---
+# DNS এবং নেটওয়ার্ক সমাধানের জন্য প্রয়োজনীয় লাইব্রেরি
+try:
+    import dns.asyncresolver
+    import httpcore
+    import anyio
+except ImportError as e:
+    print(f"❌ [FATAL] প্রয়োজনীয় লাইব্রেরি ইনস্টল করা নেই: {e}")
+    print("❌ [FATAL] দয়া করে `pip install dnspython httpcore anyio` চালান।")
+    exit()
+
+from typing import Optional
+
+# --- [মডিউল ১: চূড়ান্ত কনফিগারেশন] ---
 BOT_TOKEN_HARDCODED = "8328958637:AAEZ88XR-Ksov_RHDyT0_nKPgBEL1K876Y8"
 CHANNEL_ID_HARDCODED = "-1002557789082"
 BITLY_TOKEN_HARDCODED = "2feb4ec89bdbb72e24eaf85536d6149d948393cc"
@@ -43,13 +55,47 @@ def add_article_to_db(unique_id, source):
     conn.commit()
     conn.close()
 
-# --- [মডিউল ৩: নেটওয়ার্ক এবং ইউটিলিটি] (অপরিবর্তিত) ---
-async def create_retry_client():
-    transport = httpx.AsyncHTTPTransport(retries=3)
-    client = httpx.AsyncClient(transport=transport, timeout=30)
-    print("✅ [SUCCESS] স্ট্যান্ডার্ড ক্লায়েন্ট সফলভাবে তৈরি হয়েছে।")
-    return client
+# --- [মডিউল ৩: চূড়ান্ত ডিএনএস এবং এসএসএল সমাধান] ---
+class CustomDNSBackend(httpcore.AnyIOBackend):
+    async def connect_tcp(
+        self, host: str, port: int, timeout: float = None, local_address: Optional[str] = None, **kwargs
+    ) -> httpcore.AsyncNetworkStream:
+        
+        original_host = host
+        try:
+            resolver = dns.asyncresolver.Resolver(configure=False)
+            resolver.nameservers = ["8.8.8.8", "1.1.1.1"]
+            answers = await resolver.resolve(original_host)
+            ip_to_connect = answers[0].address
+        except Exception:
+            ip_to_connect = original_host
 
+        # এই tls_hostname প্যারামিটারটিই IP address mismatch এররটি সমাধান করে
+        stream = await anyio.open_tcp_stream(
+            host=ip_to_connect,
+            port=port,
+            connect_timeout=timeout,
+            local_address=local_address,
+            tls_hostname=original_host,
+            **kwargs
+        )
+        return httpcore.AnyIOStream(stream)
+
+# --- [মডিউল ৪: নেটওয়ার্ক এবং ইউটিলিটি] ---
+async def create_retry_client():
+    """সার্ভারের DNS সমস্যা সমাধানের জন্য একটি কাস্টম ক্লায়েন্ট তৈরি করে।"""
+    print("[INFO] কাস্টম DNS ব্যাকএন্ড দিয়ে ক্লায়েন্ট তৈরির চেষ্টা করা হচ্ছে...")
+    try:
+        backend = CustomDNSBackend()
+        transport = httpx.AsyncHTTPTransport(network=backend, retries=2)
+        client = httpx.AsyncClient(transport=transport, timeout=40)
+        print("✅ [SUCCESS] কাস্টম DNS ক্লায়েন্ট সফলভাবে তৈরি হয়েছে।")
+        return client
+    except Exception as e:
+        print(f"❌ [ERROR] কাস্টম ক্লায়েন্ট তৈরিতে একটি অপ্রত্যাশিত ত্রুটি ঘটেছে: {e}")
+        return None
+
+# --- [বাকি সমস্ত কোড অপরিবর্তিত] ---
 async def fetch_api_data(session, url):
     try:
         response = await session.get(url, headers={'User-Agent': 'Mozilla/5.0'})
@@ -113,9 +159,20 @@ async def send_news_alert(bot: Bot, news_info: dict, session: httpx.AsyncClient)
             print(f"❌❌ [FATAL SEND] দ্বিতীয়বার চেষ্টাতেও মেসেজ পাঠানো সম্ভব হয়নি: {final_e}")
             return False
 
-# --- [মডিউল ৫: মূল লজিক] ---
+def find_image_url_from_story(story_data):
+    try:
+        if key := story_data.get("metadata", {}).get("social-share", {}).get("image", {}).get("key"):
+            return f"https://images.prothomalo.com/{key}"
+        if "cards" in story_data:
+            for card in story_data.get("cards", []):
+                for element in card.get("story-elements", []):
+                    if element.get("type") == "image" and element.get("image-s3-key"):
+                        return f"https://images.prothomalo.com/{element['image-s3-key']}"
+    except Exception as e:
+        print(f"--> [WARN] ছবি পার্স করার সময় একটি অপ্রত্যাশিত ত্রুটি ঘটেছে: {e}")
+    return None
+
 async def check_teletalk_jobs(session, bot):
-    # (অপরিবর্তিত)
     print(f"[{time.strftime('%H:%M:%S')}] [CHECK] Teletalk থেকে চাকরির খবর চেক করা হচ্ছে...")
     url = "https://alljobs.teletalk.com.bd/api/v1/govt-jobs/list?skipLimit=YES"
     response = await fetch_api_data(session, url)
@@ -133,11 +190,7 @@ async def check_teletalk_jobs(session, bot):
                     add_article_to_db(job_id, "teletalk")
                     await asyncio.sleep(5)
 
-# ======================================================================
-# *** এই ফাংশনটি আপডেট করা হয়েছে ***
-# ======================================================================
 async def check_prothomalo_news(session, bot):
-    """Prothom Alo API থেকে নতুন সংবাদ চেক করে এবং ছবির জন্য একাধিক জায়গা পরীক্ষা করে।"""
     print(f"[{time.strftime('%H:%M:%S')}] [CHECK] Prothom Alo থেকে সর্বশেষ খবর চেক করা হচ্ছে...")
     url = "https://www.prothomalo.com/api/v1/collections/latest?limit=15&item-type=story&fields=id,headline,slug,url,subheadline,cards,metadata"
     response = await fetch_api_data(session, url)
@@ -147,54 +200,35 @@ async def check_prothomalo_news(session, bot):
             story_id = f"palo_{story_wrapper.get('id')}"
             headline = story_data.get("headline")
             slug = story_data.get("slug")
+            
             if story_id and headline and not is_article_posted(story_id):
                 print(f"--> [NEW POST] নতুন খবর সনাক্ত করা হয়েছে: {headline}")
                 subheadline = story_data.get("subheadline")
+                photo_url = find_image_url_from_story(story_data)
                 
-                # --- ছবির জন্য উন্নত লজিক ---
-                photo_url = None
-                try:
-                    # ধাপ ১: প্রথমে মূল metadata-তে ছবি খোঁজা হচ্ছে
-                    if key := story_data.get("metadata", {}).get("social-share", {}).get("image", {}).get("key"):
-                        photo_url = f"https://images.prothomalo.com/{key}"
-
-                    # ধাপ ২: যদি প্রথম ধাপে না পাওয়া যায়, তাহলে ভেতরের 'cards'-এ খোঁজা হচ্ছে
-                    if not photo_url and "cards" in story_data:
-                        for card in story_data.get("cards", []):
-                            for element in card.get("story-elements", []):
-                                if element.get("type") == "image" and element.get("image-s3-key"):
-                                    photo_url = f"https://images.prothomalo.com/{element['image-s3-key']}"
-                                    # একটি ছবি পেলেই লুপ থেকে বেরিয়ে আসা হবে
-                                    break 
-                            if photo_url:
-                                break
-                except Exception as e:
-                    print(f"--> [WARN] ছবি পার্স করার সময় একটি অপ্রত্যাশিত ত্রুটি ঘটেছে: {e}")
-
                 news_info = {"title": headline, "subheadline": subheadline, "url": f"https://www.prothomalo.com/{slug}", "photo_url": photo_url}
                 if await send_news_alert(bot, news_info, session):
                     add_article_to_db(story_id, "prothomalo")
                     await asyncio.sleep(10)
 
-# ======================================================================
-# *** আর কোনো পরিবর্তন নেই ***
-# ======================================================================
-
 async def main_loop():
-    # (অপরিবর্তিত)
     if not BOT_TOKEN or not CHANNEL_ID or "YOUR_BOT_TOKEN_HERE" in BOT_TOKEN:
-        print("❌ [FATAL] BOT_TOKEN or CHANNEL_ID is not set. Please check your configuration.")
+        print("❌ [FATAL] BOT_TOKEN or CHANNEL_ID is not set.")
         return
 
     bot = Bot(token=BOT_TOKEN)
     session = await create_retry_client()
     
+    if session is None:
+        print("❌ [FATAL] HTTP Client could not be created. Exiting.")
+        return
+
     try:
         await bot.get_me()
-        await bot.send_message(chat_id=CHANNEL_ID, text="✅ সমন্বিত নিউজ ও জব বুলেটিন বট সফলভাবে অনলাইন।")
+        await bot.send_message(chat_id=CHANNEL_ID, text="✅ সমন্বিত নিউজ ও জব বুলেটিন বট সফলভাবে অনলাইন। (Build: DNS-Fixed)")
         print("✅ [SUCCESS] বট সফলভাবে টেলিগ্রামের সাথে সংযোগ স্থাপন করেছে।")
     except Exception as e:
-        print(f"❌ [STARTUP FAILED] Could not connect to Telegram. Check BOT_TOKEN and CHANNEL_ID. Error: {e}")
+        print(f"❌ [STARTUP FAILED] Could not connect to Telegram. Error: {e}")
         return
 
     print("--- [INFO] Hybrid scheduler is now running. ---")
@@ -204,14 +238,13 @@ async def main_loop():
             await check_teletalk_jobs(session, bot)
             await check_prothomalo_news(session, bot)
             check_interval_minutes = 5
-            print(f"[{time.strftime('%H:%M:%S')}] [SLEEP] Waiting for {check_interval_minutes} minutes until the next check...")
+            print(f"[{time.strftime('%H:%M:%S')}] [SLEEP] Waiting for {check_interval_minutes} minutes...")
             await asyncio.sleep(check_interval_minutes * 60)
         except Exception as e:
             print(f"❌ [MAIN LOOP ERROR] An unexpected error occurred: {e}")
             await asyncio.sleep(60)
 
 if __name__ == '__main__':
-    # (অপরিবর্তিত)
     print("--- [INFO] Initializing database... ---")
     setup_database()
     
