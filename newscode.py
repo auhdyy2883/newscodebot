@@ -10,23 +10,18 @@ import os
 import json
 
 # --- [মডিউল ১: চূড়ান্ত এবং নির্ভরযোগ্য কনফিগারেশন] ---
+BOT_TOKEN_HARDCODED = "8328958637:AAEZ88XR-Ksov_RHDyT0_nKPgBEL1K876Y8"
+CHANNEL_ID_HARDCODED = "-1002557789082"
+BITLY_TOKEN_HARDCODED = "2feb4ec89bdbb72e24eaf85536d6149d948393cc"
 
-# ধাপ ১: প্রথমে সরাসরি কোড থেকে টোকেনগুলো লোড করার চেষ্টা করা হচ্ছে (cPanel-এর জন্য ফলব্যাক)
-BOT_TOKEN_HARDCODED = "8328958637:AAEZ88XR-Ksov_RHDyT0_nKPgBEL1K876Y8"  # <--- আপনার বট টোকেন এখানে দিন
-CHANNEL_ID_HARDCODED = "-1002557789082" # <--- আপনার চ্যানেল আইডি এখানে দিন
-BITLY_TOKEN_HARDCODED = "2feb4ec89bdbb72e24eaf85536d6149d948393cc" # <--- আপনার Bitly টোকেন দিন (না থাকলে খালি রাখুন)
-
-# ধাপ ২: এরপর Environment Variable থেকে লোড করার চেষ্টা করা হচ্ছে (Render/VPS-এর জন্য)
-# যদি এনভায়রনমেন্ট ভেরিয়েবল সেট করা থাকে, তাহলে সেটিই ব্যবহৃত হবে।
 BOT_TOKEN = os.environ.get("BOT_TOKEN", BOT_TOKEN_HARDCODED)
 CHANNEL_ID = os.environ.get("CHANNEL_ID", CHANNEL_ID_HARDCODED)
 BITLY_ACCESS_TOKEN = os.environ.get("BITLY_ACCESS_TOKEN", BITLY_TOKEN_HARDCODED)
 
 DATABASE_FILE = "hybrid_news_database.db"
 
-# --- [মডিউল ২: ডেটাবেস ম্যানেজমেন্ট] ---
+# --- [মডিউল ২: ডেটাবেস ম্যানেজমেন্ট] (অপরিবর্তিত) ---
 def setup_database():
-    """ডেটাবেস এবং টেবিল তৈরি করে।"""
     conn = sqlite3.connect(DATABASE_FILE)
     cursor = conn.cursor()
     cursor.execute('CREATE TABLE IF NOT EXISTS posted_articles (unique_id TEXT PRIMARY KEY, source TEXT NOT NULL)')
@@ -34,7 +29,6 @@ def setup_database():
     conn.close()
 
 def is_article_posted(unique_id):
-    """ডেটাবেসে আর্টিকেলটি আগে পোস্ট করা হয়েছে কি না, তা পরীক্ষা করে।"""
     conn = sqlite3.connect(DATABASE_FILE)
     cursor = conn.cursor()
     cursor.execute('SELECT unique_id FROM posted_articles WHERE unique_id = ?', (unique_id,))
@@ -43,23 +37,20 @@ def is_article_posted(unique_id):
     return result is not None
 
 def add_article_to_db(unique_id, source):
-    """পোস্ট করা আর্টিকেলের আইডি ডেটাবেসে যোগ করে।"""
     conn = sqlite3.connect(DATABASE_FILE)
     cursor = conn.cursor()
     cursor.execute('INSERT INTO posted_articles (unique_id, source) VALUES (?, ?)', (unique_id, source))
     conn.commit()
     conn.close()
 
-# --- [মডিউল ৩: নেটওয়ার্ক এবং ইউটিলিটি] ---
+# --- [মডিউল ৩: নেটওয়ার্ক এবং ইউটিলিটি] (অপরিবর্তিত) ---
 async def create_retry_client():
-    """স্ট্যান্ডার্ড সার্ভার পরিবেশের জন্য সহজ এবং নির্ভরযোগ্য HTTP ক্লায়েন্ট তৈরি করে।"""
     transport = httpx.AsyncHTTPTransport(retries=3)
     client = httpx.AsyncClient(transport=transport, timeout=30)
     print("✅ [SUCCESS] স্ট্যান্ডার্ড ক্লায়েন্ট সফলভাবে তৈরি হয়েছে।")
     return client
 
 async def fetch_api_data(session, url):
-    """একটি URL থেকে JSON ডেটা আনে এবং এরর হ্যান্ডেল করে।"""
     try:
         response = await session.get(url, headers={'User-Agent': 'Mozilla/5.0'})
         response.raise_for_status()
@@ -71,7 +62,6 @@ async def fetch_api_data(session, url):
     return None
 
 async def shorten_url(session, long_url):
-    """Bitly ব্যবহার করে একটি URL ছোট করে।"""
     if not BITLY_ACCESS_TOKEN or BITLY_ACCESS_TOKEN == "YOUR_BITLY_ACCESS_TOKEN_HERE":
         return long_url
     bitly_api_url = "https://api-ssl.bitly.com/v4/shorten"
@@ -84,7 +74,6 @@ async def shorten_url(session, long_url):
         return long_url
 
 async def send_job_alert(bot: Bot, job_info: dict, session: httpx.AsyncClient):
-    """চাকরির বিজ্ঞপ্তি ফরম্যাট করে টেলিগ্রাম চ্যানেলে পাঠায়।"""
     message = (f"<b>📢 নতুন সরকারি চাকরির বিজ্ঞপ্তি!</b>\n\n<b>🏢 প্রতিষ্ঠান:</b> {job_info.get('organization', 'N/A')}\n<b>📄 শিরোনাম:</b> {job_info.get('title', 'N/A')}\n<b>📅 আবেদনের শেষ তারিখ:</b> {job_info.get('end_date', 'N/A')}\n")
     details_url = await shorten_url(session, job_info.get('url', '#'))
     apply_url = await shorten_url(session, job_info.get('apply_url', '#'))
@@ -94,7 +83,6 @@ async def send_job_alert(bot: Bot, job_info: dict, session: httpx.AsyncClient):
     return True
 
 async def send_news_alert(bot: Bot, news_info: dict, session: httpx.AsyncClient):
-    """সংবাদ ফরম্যাট করে ছবিসহ বা ছবি ছাড়া টেলিগ্রাম চ্যানেলে পাঠায়।"""
     headline = news_info.get('title', 'N/A')
     subheadline = news_info.get('subheadline') or ''
     message = f"<b>{headline}</b>\n\n{subheadline}"
@@ -127,7 +115,7 @@ async def send_news_alert(bot: Bot, news_info: dict, session: httpx.AsyncClient)
 
 # --- [মডিউল ৫: মূল লজিক] ---
 async def check_teletalk_jobs(session, bot):
-    """Teletalk API থেকে নতুন চাকরির খবর চেক করে।"""
+    # (অপরিবর্তিত)
     print(f"[{time.strftime('%H:%M:%S')}] [CHECK] Teletalk থেকে চাকরির খবর চেক করা হচ্ছে...")
     url = "https://alljobs.teletalk.com.bd/api/v1/govt-jobs/list?skipLimit=YES"
     response = await fetch_api_data(session, url)
@@ -145,8 +133,11 @@ async def check_teletalk_jobs(session, bot):
                     add_article_to_db(job_id, "teletalk")
                     await asyncio.sleep(5)
 
+# ======================================================================
+# *** এই ফাংশনটি আপডেট করা হয়েছে ***
+# ======================================================================
 async def check_prothomalo_news(session, bot):
-    """Prothom Alo API থেকে নতুন সংবাদ চেক করে।"""
+    """Prothom Alo API থেকে নতুন সংবাদ চেক করে এবং ছবির জন্য একাধিক জায়গা পরীক্ষা করে।"""
     print(f"[{time.strftime('%H:%M:%S')}] [CHECK] Prothom Alo থেকে সর্বশেষ খবর চেক করা হচ্ছে...")
     url = "https://www.prothomalo.com/api/v1/collections/latest?limit=15&item-type=story&fields=id,headline,slug,url,subheadline,cards,metadata"
     response = await fetch_api_data(session, url)
@@ -159,20 +150,39 @@ async def check_prothomalo_news(session, bot):
             if story_id and headline and not is_article_posted(story_id):
                 print(f"--> [NEW POST] নতুন খবর সনাক্ত করা হয়েছে: {headline}")
                 subheadline = story_data.get("subheadline")
+                
+                # --- ছবির জন্য উন্নত লজিক ---
                 photo_url = None
                 try:
+                    # ধাপ ১: প্রথমে মূল metadata-তে ছবি খোঁজা হচ্ছে
                     if key := story_data.get("metadata", {}).get("social-share", {}).get("image", {}).get("key"):
                         photo_url = f"https://images.prothomalo.com/{key}"
-                except Exception as e: print(f"--> [WARN] ছবি পার্স করার সময় এরর: {e}")
+
+                    # ধাপ ২: যদি প্রথম ধাপে না পাওয়া যায়, তাহলে ভেতরের 'cards'-এ খোঁজা হচ্ছে
+                    if not photo_url and "cards" in story_data:
+                        for card in story_data.get("cards", []):
+                            for element in card.get("story-elements", []):
+                                if element.get("type") == "image" and element.get("image-s3-key"):
+                                    photo_url = f"https://images.prothomalo.com/{element['image-s3-key']}"
+                                    # একটি ছবি পেলেই লুপ থেকে বেরিয়ে আসা হবে
+                                    break 
+                            if photo_url:
+                                break
+                except Exception as e:
+                    print(f"--> [WARN] ছবি পার্স করার সময় একটি অপ্রত্যাশিত ত্রুটি ঘটেছে: {e}")
+
                 news_info = {"title": headline, "subheadline": subheadline, "url": f"https://www.prothomalo.com/{slug}", "photo_url": photo_url}
                 if await send_news_alert(bot, news_info, session):
                     add_article_to_db(story_id, "prothomalo")
                     await asyncio.sleep(10)
 
+# ======================================================================
+# *** আর কোনো পরিবর্তন নেই ***
+# ======================================================================
+
 async def main_loop():
-    """বটের মূল লুপ, যা নির্দিষ্ট সময় পর পর জব এবং নিউজ চেক করে।"""
-    if not BOT_TOKEN or not CHANNEL_ID:
-        # বাংলা টেক্সট বাদ দিয়ে ইংরেজি ব্যবহার করা হচ্ছে এনকোডিং সমস্যা এড়ানোর জন্য
+    # (অপরিবর্তিত)
+    if not BOT_TOKEN or not CHANNEL_ID or "YOUR_BOT_TOKEN_HERE" in BOT_TOKEN:
         print("❌ [FATAL] BOT_TOKEN or CHANNEL_ID is not set. Please check your configuration.")
         return
 
@@ -200,8 +210,8 @@ async def main_loop():
             print(f"❌ [MAIN LOOP ERROR] An unexpected error occurred: {e}")
             await asyncio.sleep(60)
 
-# --- [মডিউল ৬: প্রোগ্রাম শুরু] ---
 if __name__ == '__main__':
+    # (অপরিবর্তিত)
     print("--- [INFO] Initializing database... ---")
     setup_database()
     
