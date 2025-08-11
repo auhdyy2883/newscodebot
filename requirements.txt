@@ -2,3 +2,5 @@ python-telegram-bot[job-queue]
 httpx
 pytz
 dnspython
+aiohttp
+aiodns # aiohttp-এর সাথে নির্ভরযোগ্য DNS-এর জন্য
