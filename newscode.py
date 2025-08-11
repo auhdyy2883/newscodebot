@@ -8,15 +8,8 @@ from datetime import datetime
 import pytz
 import os
 import json
-
-# DNS সমাধানের জন্য প্রয়োজনীয় লাইব্রেরি
-try:
-    import dns.asyncresolver
-except ImportError:
-    print("❌ [FATAL] dnspython লাইব্রেরি ইনস্টল করা নেই। দয়া করে `pip install dnspython` চালান।")
-    exit()
-
-from httpcore import Request, Response
+import aiohttp # <-- ছবি ডাউনলোডের জন্য নতুন লাইব্রেরি
+import aiodns # <-- aiohttp-এর DNS সমাধানের জন্য
 
 # --- [মডিউল ১: চূড়ান্ত এবং নির্ভরযোগ্য কনফিগারেশন] ---
 BOT_TOKEN_HARDCODED = "8328958637:AAEZ88XR-Ksov_RHDyT0_nKPgBEL1K876Y8"
@@ -52,55 +45,14 @@ def add_article_to_db(unique_id, source):
     conn.commit()
     conn.close()
 
-# --- [মডিউল ৩: পুরনো httpx-এর জন্য কাস্টম ডিএনএস সমাধানকারী] ---
-class CustomDNSResolverTransport(httpx.AsyncHTTPTransport):
-    async def handle_async_request(self, request: Request) -> Response:
-        # request.url.host একটি বাইটস স্ট্রিং হতে পারে, তাই স্ট্রিং-এ রূপান্তর করা হচ্ছে
-        try:
-            hostname = request.url.host.decode("utf-8")
-        except (UnicodeDecodeError, AttributeError):
-            hostname = request.url.host
-
-        try:
-            resolver = dns.asyncresolver.Resolver(configure=False)
-            resolver.nameservers = ["8.8.8.8", "1.1.1.1"]
-            answers = await resolver.resolve(hostname)
-            ip = answers[0].address
-            
-            # URL-এর host পরিবর্তন করে IP বসানো হচ্ছে
-            request.url = request.url.copy_with(host=ip)
-            # সার্ভারকে আসল ডোমেইন নেম জানানোর জন্য Host হেডার সেট করা হচ্ছে
-            request.headers["Host"] = hostname
-        except Exception as e:
-            print(f"--> [DNS WARNING] হোস্টনেম '{hostname}' সমাধান করা যায়নি: {e}.")
-            pass
-        
-        return await super().handle_async_request(request)
-
-# --- [মডিউল ৪: নেটওয়ার্ক এবং ইউটিলিটি] ---
+# --- [মডিউল ৩: নেটওয়ার্ক এবং ইউটিলিটি] ---
 async def create_retry_client():
-    """
-    cPanel-এর পুরনো httpx সংস্করণের জন্য চূড়ান্ত ক্লায়েন্ট যা SSL ভেরিফিকেশন বাইপাস করে।
-    """
-    print("[INFO] কাস্টম DNS এবং SSL-Bypass ক্লায়েন্ট তৈরির চেষ্টা করা হচ্ছে...")
-    try:
-        # আমাদের কাস্টম ট্রান্সপোর্ট ব্যবহার করা হচ্ছে যা network আর্গুমেন্ট ছাড়া কাজ করে
-        transport = CustomDNSResolverTransport(retries=2, verify=False)
+    """API ডেটা আনার জন্য সাধারণ httpx ক্লায়েন্ট।"""
+    transport = httpx.AsyncHTTPTransport(retries=3)
+    client = httpx.AsyncClient(transport=transport, timeout=30)
+    print("✅ [SUCCESS] স্ট্যান্ডার্ড httpx ক্লায়েন্ট সফলভাবে তৈরি হয়েছে।")
+    return client
 
-        # ক্লায়েন্ট তৈরি করার সময়ও SSL ভেরিফিকেশন বন্ধ করা হচ্ছে
-        client = httpx.AsyncClient(
-            transport=transport,
-            timeout=40,
-            headers={'User-Agent': 'Mozilla/5.0'}
-        )
-        print("⚠️  [WARNING] ক্লায়েন্ট SSL ভেরিফিকেশন ছাড়া তৈরি হয়েছে।")
-        print("✅ [SUCCESS] ক্লায়েন্ট সফলভাবে চূড়ান্ত কনফিগারেশন দিয়ে তৈরি হয়েছে।")
-        return client
-    except Exception as e:
-        print(f"❌ [ERROR] কাস্টম ক্লায়েন্ট তৈরিতে একটি অপ্রত্যাশিত ত্রুটি ঘটেছে: {e}")
-        return None
-
-# --- [বাকি সমস্ত কোড অপরিবর্তিত] ---
 async def fetch_api_data(session, url):
     try:
         response = await session.get(url, headers={'User-Agent': 'Mozilla/5.0'})
@@ -110,6 +62,59 @@ async def fetch_api_data(session, url):
         print(f"[{time.strftime('%H:%M:%S')}] [NETWORK ERROR] API থেকে ডেটা আনার সময় সমস্যা: {url} | এরর: {e}")
         return None
 
+# --- [নতুন মডিউল: aiohttp দিয়ে ছবি ডাউনলোড] ---
+async def download_image_with_aiohttp(photo_url):
+    """
+    aiohttp এবং কাস্টম DNS ব্যবহার করে একটি ছবি ডাউনলোড করে।
+    এটি httpx-এর DNS এবং SSL সমস্যা এড়িয়ে যায়।
+    """
+    try:
+        # গুগল DNS ব্যবহার করে একটি কাস্টম resolver তৈরি করা হচ্ছে
+        resolver = aiohttp.resolver.AsyncResolver(nameservers=["8.8.8.8", "1.1.1.1"])
+        connector = aiohttp.TCPConnector(resolver=resolver, ssl=False) # SSL ভেরিফিকেশন বাইপাস করা হচ্ছে
+        
+        async with aiohttp.ClientSession(connector=connector) as session:
+            headers = {'Referer': 'https://www.prothomalo.com/', 'User-Agent': 'Mozilla/5.0'}
+            async with session.get(photo_url, headers=headers) as response:
+                response.raise_for_status()
+                return await response.read() # ছবির বাইটস রিটার্ন করা হচ্ছে
+    except Exception as e:
+        print(f"❌❌ [AIOHTTP ERROR] aiohttp দিয়ে ছবি ডাউনলোড করা সম্ভব হয়নি: {e}")
+        return None
+
+# --- [send_news_alert ফাংশনটি আপডেট করা হয়েছে] ---
+async def send_news_alert(bot: Bot, news_info: dict, session: httpx.AsyncClient):
+    headline = news_info.get('title', 'N/A')
+    subheadline = news_info.get('subheadline') or ''
+    message = f"<b>{headline}</b>\n\n{subheadline}"
+    # shorten_url এখন httpx session ব্যবহার করবে
+    short_url = await shorten_url(session, news_info.get('url', '#'))
+    keyboard = [[InlineKeyboardButton("📄 বিস্তারিত পড়ুন", url=short_url)]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    photo_url = news_info.get('photo_url')
+    
+    try:
+        if photo_url:
+            print(f"--> [INFO] ছবিসহ পোস্ট করার চেষ্টা করা হচ্ছে (Method: aiohttp)। ছবির URL: {photo_url}")
+            # নতুন ফাংশন দিয়ে ছবি ডাউনলোড করা হচ্ছে
+            photo_bytes = await download_image_with_aiohttp(photo_url)
+            
+            if photo_bytes:
+                await bot.send_photo(chat_id=CHANNEL_ID, photo=photo_bytes, caption=message, parse_mode='HTML', reply_markup=reply_markup)
+            else:
+                # ছবি ডাউনলোড ব্যর্থ হলে, ছবি ছাড়াই পোস্ট করা হবে
+                print("--> [FALLBACK] ছবি ডাউনলোড ব্যর্থ হওয়ায়, টেক্সট হিসেবে পোস্ট করা হচ্ছে।")
+                await bot.send_message(chat_id=CHANNEL_ID, text=message, parse_mode='HTML', reply_markup=reply_markup, disable_web_page_preview=True)
+        else:
+            await bot.send_message(chat_id=CHANNEL_ID, text=message, parse_mode='HTML', reply_markup=reply_markup, disable_web_page_preview=True)
+            
+        print(f"--> [SUCCESS] খবর '{headline}' সফলভাবে চ্যানেলে পোস্ট করা হয়েছে।")
+        return True
+    except Exception as e:
+        print(f"❌❌ [SEND ERROR] মেসেজ পাঠানো সম্ভব হয়নি: {e}")
+        return False
+
+# --- [বাকি কোড প্রায় অপরিবর্তিত] ---
 async def shorten_url(session, long_url):
     if not BITLY_ACCESS_TOKEN or BITLY_ACCESS_TOKEN == "YOUR_BITLY_ACCESS_TOKEN_HERE":
         return long_url
@@ -130,37 +135,6 @@ async def send_job_alert(bot: Bot, job_info: dict, session: httpx.AsyncClient):
     reply_markup = InlineKeyboardMarkup(keyboard)
     await bot.send_message(chat_id=CHANNEL_ID, text=message, parse_mode='HTML', reply_markup=reply_markup, disable_web_page_preview=True)
     return True
-
-async def send_news_alert(bot: Bot, news_info: dict, session: httpx.AsyncClient):
-    headline = news_info.get('title', 'N/A')
-    subheadline = news_info.get('subheadline') or ''
-    message = f"<b>{headline}</b>\n\n{subheadline}"
-    short_url = await shorten_url(session, news_info.get('url', '#'))
-    keyboard = [[InlineKeyboardButton("📄 বিস্তারিত পড়ুন", url=short_url)]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    photo_url = news_info.get('photo_url')
-    try:
-        if photo_url:
-            print(f"--> [INFO] ছবিসহ পোস্ট করার চেষ্টা করা হচ্ছে। ছবির URL: {photo_url}")
-            headers = {'Referer': 'https://www.prothomalo.com/'}
-            photo_response = await session.get(photo_url, headers=headers)
-            photo_response.raise_for_status()
-            photo_bytes = photo_response.content
-            await bot.send_photo(chat_id=CHANNEL_ID, photo=photo_bytes, caption=message, parse_mode='HTML', reply_markup=reply_markup)
-        else:
-            await bot.send_message(chat_id=CHANNEL_ID, text=message, parse_mode='HTML', reply_markup=reply_markup, disable_web_page_preview=True)
-        print(f"--> [SUCCESS] খবর '{headline}' সফলভাবে চ্যানেলে পোস্ট করা হয়েছে।")
-        return True
-    except Exception as e:
-        print(f"❌❌ [SEND ERROR] মেসেজ পাঠানো সম্ভব হয়নি: {e}")
-        try:
-            print("--> [RETRY] ছবি ছাড়া শুধু টেক্সট পাঠানোর চেষ্টা করা হচ্ছে...")
-            await bot.send_message(chat_id=CHANNEL_ID, text=message, parse_mode='HTML', reply_markup=reply_markup, disable_web_page_preview=False)
-            print(f"--> [SUCCESS] খবর '{headline}' (শুধু টেক্সট) সফলভাবে পোস্ট করা হয়েছে।")
-            return True
-        except Exception as final_e:
-            print(f"❌❌ [FATAL SEND] দ্বিতীয়বার চেষ্টাতেও মেসেজ পাঠানো সম্ভব হয়নি: {final_e}")
-            return False
 
 def find_image_url_from_story(story_data):
     try:
@@ -220,15 +194,16 @@ async def main_loop():
         return
 
     bot = Bot(token=BOT_TOKEN)
-    session = await create_retry_client()
+    # httpx ক্লায়েন্টটি শুধু API ডেটা আনার জন্য ব্যবহৃত হবে
+    httpx_session = await create_retry_client()
     
-    if session is None:
+    if httpx_session is None:
         print("❌ [FATAL] HTTP Client could not be created. Exiting.")
         return
 
     try:
         await bot.get_me()
-        await bot.send_message(chat_id=CHANNEL_ID, text="✅ সমন্বিত নিউজ ও জব বুলেটিন বট সফলভাবে অনলাইন। (Build: cPanel-Final)")
+        await bot.send_message(chat_id=CHANNEL_ID, text="✅ সমন্বিত নিউজ ও জব বুলেটিন বট সফলভাবে অনলাইন। (Build: aiohttp-Final)")
         print("✅ [SUCCESS] বট সফলভাবে টেলিগ্রামের সাথে সংযোগ স্থাপন করেছে।")
     except Exception as e:
         print(f"❌ [STARTUP FAILED] Could not connect to Telegram. Error: {e}")
@@ -238,8 +213,9 @@ async def main_loop():
 
     while True:
         try:
-            await check_teletalk_jobs(session, bot)
-            await check_prothomalo_news(session, bot)
+            # check ফাংশনগুলোতে httpx সেশনটি পাস করা হচ্ছে
+            await check_teletalk_jobs(httpx_session, bot)
+            await check_prothomalo_news(httpx_session, bot)
             check_interval_minutes = 5
             print(f"[{time.strftime('%H:%M:%S')}] [SLEEP] Waiting for {check_interval_minutes} minutes...")
             await asyncio.sleep(check_interval_minutes * 60)
